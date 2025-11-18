@@ -1,0 +1,354 @@
+
+# ==========================================================
+# PLAY 1: Rocky Linux 9.6 Offline Patch Playbook
+# ==========================================================
+- name: Rocky Linux 9.6 Offline Patch Playbook
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    log_dir: "/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/rocky/logs"
+    mirror_host: "####"
+    rocky_repo_baseurl: "https://{{ mirror_host }}/updates/rocky/9.5/daily"
+    offline_repos:
+      - { name: baseos,           baseurl: "{{ rocky_repo_baseurl }}/baseos/" }
+      - { name: appstream,        baseurl: "{{ rocky_repo_baseurl }}/appstream/" }
+      - { name: crb,              baseurl: "{{ rocky_repo_baseurl }}/crb/" }
+      - { name: epel,             baseurl: "{{ rocky_repo_baseurl }}/epel/" }
+      - { name: extras,           baseurl: "{{ rocky_repo_baseurl }}/extras/" }
+      - { name: highavailability, baseurl: "{{ rocky_repo_baseurl }}/highavailability/" }
+      - { name: zabbix,           baseurl: "{{ rocky_repo_baseurl }}/zabbix/" }
+      - { name: zabbix-tools,     baseurl: "{{ rocky_repo_baseurl }}/zabbix-tools/" }
+
+  pre_tasks:
+    - name: Compute UTC run timestamp for filenames
+      run_once: true
+      delegate_to: localhost
+      become: false
+      set_fact:
+        run_ts: "{{ lookup('pipe','date -u +%Y%m%dT%H%M%SZ') }}"
+        run_ts_human: "{{ lookup('pipe','date -u +%Y-%m-%d_%H:%M:%S_UTC') }}"
+      delegate_facts: true
+
+    - name: Add mirror host entry (managed block)
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} rocky-offline-mirror"
+        block: |
+          {{ mirror_host }} mirror.peratonlabs.com
+
+  tasks:
+    - name: Initialize patch variables
+      ansible.builtin.set_fact:
+        patch_error_msg: ""
+        started_epoch: "{{ ansible_date_time.epoch }}"
+        started_at: "{{ ansible_date_time.iso8601 }}"
+      changed_when: false
+
+    - name: Capture kernel version before patching
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Verify mirror connectivity (HTTPS)
+      ansible.builtin.wait_for:
+        host: "{{ mirror_host }}"
+        port: 443
+        timeout: 30
+      become: false
+
+        # -----  Backup existing repositories -----
+    - name: Backup existing .repo files
+      ansible.builtin.shell: |
+        mkdir -p /etc/yum.repos.d/backup_{{ hostvars['localhost'].run_ts }}
+        mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup_{{ hostvars['localhost'].run_ts }}/ 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Execute patching operations
+      become: true
+      block:
+        # ----- 1. Repository Setup -----
+        - name: Create separate offline repo files
+          ansible.builtin.copy:
+            dest: "/etc/yum.repos.d/mirror-offline-{{ item.name }}.repo"
+            content: |
+              [mirror-offline-{{ item.name }}]
+              name=Offline {{ item.name | capitalize }}
+              baseurl={{ item.baseurl }}
+              enabled=1
+              gpgcheck=0
+              sslverify=0
+          loop: "{{ offline_repos }}"
+
+        # ----- 2. Pre-flight Check -----
+        - name: Verify sufficient disk space in /var
+          ansible.builtin.shell: "df --output=avail -BG /var | tail -n 1 | tr -d ' G'"
+          register: space_check
+          changed_when: false
+          failed_when: (space_check.stdout | int) < 2
+
+        # ----- 3. Package Update Operations -----
+        - name: Clean DNF metadata
+          ansible.builtin.command: dnf clean all
+          changed_when: false
+
+        - name: Update DNF cache
+          ansible.builtin.command: dnf makecache
+          changed_when: false
+
+        - name: Perform standard package upgrade
+          ansible.builtin.shell: dnf -y upgrade --refresh
+          register: upgrade_result
+          retries: 2
+          delay: 5
+          until: upgrade_result.rc == 0
+          changed_when: "'Upgraded:' in upgrade_result.stdout or 'Installed:' in upgrade_result.stdout"
+
+        - name: Repair dependency issues (if any)
+          ansible.builtin.shell: dnf -y distro-sync
+          register: fix_broken_result
+          changed_when: "'Upgraded:' in fix_broken_result.stdout or 'Downgraded:' in fix_broken_result.stdout"
+          failed_when: false
+
+        # ----- 4. Post-patch Cleanup -----
+        - name: Remove all temporary offline repo configurations
+          become: true
+          ansible.builtin.shell: rm -rf /etc/yum.repos.d/mirror-offline-*.repo
+
+      rescue:
+        - name: Capture error details
+          ansible.builtin.set_fact:
+            patch_error_msg: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('Unknown error')) }}"
+
+    # ===== OUTPUT PARSING & ANALYSIS =====
+
+    - name: Extract upgraded packages properly
+      ansible.builtin.set_fact:
+        upgraded_packages: >-
+          {{
+            upgrade_result.stdout.split('Upgraded:')[1].split('Installed:')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Upgraded:' in upgrade_result.stdout and 'Installed:' in upgrade_result.stdout
+            else (upgrade_result.stdout.split('Upgraded:')[1].split('Removed:')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Upgraded:' in upgrade_result.stdout and 'Removed:' in upgrade_result.stdout
+            else (upgrade_result.stdout.split('Upgraded:')[1].split('Complete!')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Upgraded:' in upgrade_result.stdout
+            else []))
+          }}
+      changed_when: false
+
+    - name: Extract installed packages properly
+      ansible.builtin.set_fact:
+        installed_packages: >-
+          {{
+            upgrade_result.stdout.split('Installed:')[1].split('Removed:')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Installed:' in upgrade_result.stdout and 'Removed:' in upgrade_result.stdout
+            else (upgrade_result.stdout.split('Installed:')[1].split('Complete!')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Installed:' in upgrade_result.stdout
+            else [])
+          }}
+      changed_when: false
+
+    - name: Extract removed packages properly
+      ansible.builtin.set_fact:
+        removed_packages: >-
+          {{
+            upgrade_result.stdout.split('Removed:')[1].split('Complete!')[0]
+            | regex_findall('\n  (\S+)')
+            if 'Removed:' in upgrade_result.stdout
+            else []
+          }}
+      changed_when: false
+
+    - name: Combine all affected packages
+      ansible.builtin.set_fact:
+        all_packages: "{{ upgraded_packages + installed_packages }}"
+      changed_when: false
+
+    - name: Identify kernel-related packages
+      ansible.builtin.set_fact:
+        linux_kernel_packages: "{{ all_packages | select('match', '^kernel.*') | list }}"
+        kernel_pkg_touched: "{{ (all_packages | select('match', '^kernel.*') | list | length) > 0 }}"
+      changed_when: false
+
+    # ===== DYNAMIC COUNTS =====
+    - name: Count packages that are available but not upgraded
+      ansible.builtin.shell: dnf list updates | tail -n +2 | wc -l
+      register: not_upgraded_result
+      changed_when: false
+
+    - name: Count available security updates
+      ansible.builtin.shell: dnf updateinfo list security | tail -n +2 | wc -l
+      register: security_updates_result
+      changed_when: false
+
+    - name: Set security updated counts and not_upgraded
+      ansible.builtin.set_fact:
+        not_upgraded_count: "{{ not_upgraded_result.stdout | int }}"
+        standard_security_updates: "{{ security_updates_result.stdout | int }}"
+
+    # ===== DNF HISTORY CHECK =====
+    - name: Check DNF history log
+      ansible.builtin.stat:
+        path: /var/log/dnf.log
+      register: dnf_history_stat
+      changed_when: false
+
+    # ===== PATCH STATE LOGIC (ALL SIX STATES) =====
+    - name: Determine overall patch state
+      ansible.builtin.set_fact:
+        patch_state: >-
+          {{
+            'error' if (patch_error_msg | length > 0) else
+            'updated' if ((upgraded_packages | length + installed_packages | length) > 0 and dnf_history_stat.stat.exists and dnf_history_stat.stat.size > 0) else
+            'no_history' if ((upgraded_packages | length + installed_packages | length) > 0 and (not dnf_history_stat.stat.exists or dnf_history_stat.stat.size == 0)) else
+            'no_change_patched' if ((upgraded_packages | length + installed_packages | length) == 0 and dnf_history_stat.stat.exists and dnf_history_stat.stat.size > 0) else
+            'no_change_no_history' if ((upgraded_packages | length + installed_packages | length) == 0 and (not dnf_history_stat.stat.exists or dnf_history_stat.stat.size == 0)) else
+            'unreported'
+          }}
+      changed_when: false
+
+    # ===== REBOOT ANALYSIS =====
+    - name: Ensure 'dnf-plugins-core' is installed
+      ansible.builtin.package:
+        name: dnf-plugins-core
+        state: present
+
+    - name: Check if reboot required by system
+      ansible.builtin.shell: dnf needs-restarting --reboothint
+      register: reboot_check
+      changed_when: false
+      failed_when: false
+    
+
+    - name: Determine new kernel version from installed kernel packages
+      ansible.builtin.set_fact:
+        kernel_after: >-
+          {{
+            (
+              linux_kernel_packages
+              | select('match', '^kernel(-core)?-[0-9]')
+              | map('regex_replace', '^kernel(?:-core)?-', '')
+              | list
+              | sort
+              | last
+            )
+            | default(kernel_before.stdout)
+          }}
+      changed_when: false
+
+    - name: Determine reboot necessity
+      ansible.builtin.set_fact:
+        reboot_needed: "{{ reboot_check.rc != 0 or kernel_pkg_touched }}"
+        reboot_reason: >-
+          {{
+            'kernel_upgraded' if kernel_pkg_touched
+            else 'reboot_required_by_systemd' if reboot_check.rc != 0
+            else ''
+          }}
+      changed_when: false
+
+    # ===== TIMING & SUMMARY =====
+    - name: Capture finish timestamp (epoch, UTC)
+      ansible.builtin.command:
+        cmd: date -u +%s
+      register: finished_epoch_cmd
+      changed_when: false
+
+    - name: Set finished time fact (UTC ISO)
+      ansible.builtin.set_fact:
+        finished_epoch: "{{ finished_epoch_cmd.stdout | int }}"
+        finished_at: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        exec_time_sec: "{{ (finished_epoch_cmd.stdout | int) - (started_epoch | int) }}"
+      changed_when: false
+
+
+    - name: Capture system uptime (hours, minutes, seconds)
+      ansible.builtin.shell: |
+        awk '{hours=int($1/3600); mins=int(($1%3600)/60); secs=int($1%60);
+              printf "%d hours, %d minutes, %d seconds", hours, mins, secs}' /proc/uptime
+      register: uptime_result
+      changed_when: false
+
+
+    # ===== BUILD PATCH SUMMARY =====
+    - name: Build comprehensive patch summary
+      ansible.builtin.set_fact:
+        patch_summary:
+          os: "Rocky Linux {{ ansible_distribution_version }}"
+          host: "{{ inventory_hostname }}"
+          patch_state: "{{ patch_state }}"
+          uptime: "{{ uptime_result.stdout | default('unknown') }}"
+          timestamp: "{{ hostvars['localhost'].run_ts | default(started_at) }}"
+          log_dir: "{{ log_dir }}"
+          started_at: "{{ started_at }}"
+          finished_at: "{{ finished_at }}"
+          exec_time_sec: "{{ exec_time_sec | int }}"
+          kernel_before: "{{ kernel_before.stdout }}"
+          kernel_after: "{{ kernel_after }}"
+          kernel_changed: "{{ kernel_before.stdout != (kernel_after | default('')) }}"
+          reboot_needed: "{{ reboot_needed | bool }}"
+          reboot_reason: "{{ reboot_reason }}"
+          unreachable: false
+          error: "{{ patch_error_msg }}"
+          upgrade_stats:
+            upgraded: "{{ upgraded_packages | length }}"
+            newly_installed: "{{ installed_packages | length }}"
+            to_remove: "{{ removed_packages | length }}"
+            not_upgraded: "{{ not_upgraded_count }}"
+            security_updates: "{{ standard_security_updates }}"
+          packages:
+            upgraded: "{{ upgraded_packages }}"
+            newly_installed: "{{ installed_packages }}"
+            linux_kernels: "{{ linux_kernel_packages }}"
+            held_back: []
+          fix_broken:
+            changed: "{{ fix_broken_result is defined and fix_broken_result.changed }}"
+            rc: "{{ fix_broken_result.rc | default(0) }}"
+            output: "{{ fix_broken_result.stdout | default('') | trim | truncate(2000) }}"
+      changed_when: false
+
+    - name: Aggregate patch summary to localhost
+      ansible.builtin.set_fact:
+        all_hosts_summary: "{{ hostvars['localhost'].all_hosts_summary | default([]) + [patch_summary] }}"
+      delegate_to: localhost
+      delegate_facts: true
+      changed_when: false
+
+    - name: Prepare JSON data structure
+      ansible.builtin.set_fact:
+        json_data: "{{ patch_summary }}"
+      changed_when: false
+
+
+
+    # ===== CONSOLIDATED REPORT =====
+    - name: Generate consolidated patch report using Jinja2 template
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.template:
+        src: "templates/template.j2"
+        dest: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        owner: rundeck
+        group: rundeck
+        mode: "0644"
+      changed_when: false
+
+    - name: Symbolic link for latest
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.file:
+        src: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        dest: "{{ log_dir }}/master_run.json"
+        state: link
+        force: true
+

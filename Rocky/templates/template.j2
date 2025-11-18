@@ -1,0 +1,56 @@
+{
+  "patch_run_timestamp": "{{ hostvars['localhost'].run_ts | default(lookup('pipe','date -u -Iseconds')) }}",
+  "total_hosts": {{ groups['all'] | length }},
+  "hosts": [
+    {# --- First: reachable hosts --- #}
+    {% for host in groups['all'] if hostvars[host].patch_summary is defined %}
+    {
+      "os": "{{ hostvars[host].patch_summary.os }}",
+      "host": "{{ hostvars[host].patch_summary.host }}",
+      "patch_state": "{{ hostvars[host].patch_summary.patch_state }}",
+      "uptime": "{{ hostvars[host].patch_summary.uptime }}",
+      "timestamp": "{{ hostvars[host].patch_summary.timestamp }}",
+      "log_dir": "{{ hostvars[host].patch_summary.log_dir }}",
+      "started_at": "{{ hostvars[host].patch_summary.started_at }}",
+      "finished_at": "{{ hostvars[host].patch_summary.finished_at }}",
+      "exec_time_sec": {{ hostvars[host].patch_summary.exec_time_sec }},
+      "kernel_before": "{{ hostvars[host].patch_summary.kernel_before }}",
+      "kernel_after": "{{ hostvars[host].patch_summary.kernel_after }}",
+      "kernel_changed": {{ hostvars[host].patch_summary.kernel_changed | lower }},
+      "reboot_needed": {{ hostvars[host].patch_summary.reboot_needed | lower }},
+      "reboot_reason": "{{ hostvars[host].patch_summary.reboot_reason }}",
+      "unreachable": {{ hostvars[host].patch_summary.unreachable | lower }},
+      "error": "{{ hostvars[host].patch_summary.error }}",
+      "upgrade_stats": {
+        "upgraded": {{ hostvars[host].patch_summary.upgrade_stats.upgraded }},
+        "newly_installed": {{ hostvars[host].patch_summary.upgrade_stats.newly_installed }},
+        "to_remove": {{ hostvars[host].patch_summary.upgrade_stats.to_remove }},
+        "not_upgraded": {{ hostvars[host].patch_summary.upgrade_stats.not_upgraded }},
+        "security_updates": {{ hostvars[host].patch_summary.upgrade_stats.security_updates }}
+      },
+      "packages": {
+        "upgraded": {{ hostvars[host].patch_summary.packages.upgraded | to_json }},
+        "newly_installed": {{ hostvars[host].patch_summary.packages.newly_installed | to_json }},
+        "linux_kernels": {{ hostvars[host].patch_summary.packages.linux_kernels | to_json }},
+        "held_back": {{ hostvars[host].patch_summary.packages.held_back | to_json }}
+      },
+      "fix_broken": {
+        "changed": {{ hostvars[host].patch_summary.fix_broken.changed | lower }},
+        "rc": {{ hostvars[host].patch_summary.fix_broken.rc }},
+        "output": {{ hostvars[host].patch_summary.fix_broken.output | to_json }}
+      }
+    }{% if not loop.last or (groups['all'] | select('undefined', 'patch_summary') | list | length) > 0 %},{% endif %}
+    {% endfor %}
+
+    {# --- Then: unreachable hosts --- #}
+    {% set unreachable_hosts = groups['all'] | select('undefined', 'patch_summary') | list %}
+    {% for host in unreachable_hosts %}
+    {
+      "host": "{{ host }}",
+      "patch_state": "unreachable",
+      "unreachable": true,
+      "error": "Host was unreachable during playbook execution"
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ]
+}

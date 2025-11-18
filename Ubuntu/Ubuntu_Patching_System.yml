@@ -1,0 +1,503 @@
+---
+# ==========================================================
+# PLAY 0: Build dynamic_hosts with correct SSH keys
+# ==========================================================
+- name: Build dynamic_hosts with correct SSH keys
+  hosts: localhost
+  gather_facts: false
+  become: false
+
+  vars:
+    all_source_hosts: >-
+      {{
+        hostvars
+        | dict2items
+        | selectattr('value', 'defined')
+        | selectattr('value.inventory_hostname', 'defined')
+        | map(attribute='value')
+        | list
+      }}
+    mirror_ip: "10.209.1.10"
+
+  pre_tasks:
+    - name: Compute UTC run timestamp at playbook start
+      run_once: true
+      delegate_to: localhost
+      become: false
+      ansible.builtin.set_fact:
+        run_ts: "{{ lookup('pipe','date -u +%Y%m%dT%H%M%SZ') }}"
+        run_ts_human: "{{ lookup('pipe', 'date -u +%Y-%m-%d_%H:%M:%S_UTC') }}"
+      delegate_facts: true
+
+  tasks:
+    - name: Create dynamic hosts with site-specific SSH keys
+      ansible.builtin.add_host:
+        name: "{{ item.inventory_hostname }}"
+        groups: "dynamic_hosts"
+
+        ansible_host: >-
+          {{
+            item.ansible_host
+            | default(item.primary_ip4 | default(item.primary_ip | default('')))
+          }}
+
+        ansible_user: "{{ item.ansible_user | default('ansible') }}"
+        ansible_connection: ssh
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_transfer_method: 'piped'
+
+        ansible_ssh_private_key_file: >-
+          {%- set location_group = (item.group_names | default([], true)
+              | select('match', 'locations_.*')
+              | reject('equalto', 'locations_usa')
+              | first
+              | default('locations_brg')) -%}
+          {%- set site_slug_raw = location_group
+              | regex_replace('^locations_', '') -%}
+          {%- set regex_match = site_slug_raw
+              | regex_search('\\((.*?)\\)', '\\1') -%}
+          {%- set key_slug = regex_match[0]
+              if regex_match else site_slug_raw -%}
+          {{ '/usr/local/ansible/keys/workstations/ansible-' + key_slug + '-plabs-it-ubuntu-primary-ws-ecdsa' }}
+
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+          -o ControlMaster=no
+          -o ServerAliveInterval=50
+          -o RequestTTY=no
+          -o PreferredAuthentications=publickey
+
+        ansible_ssh_pipelining: true
+
+        site_slug: >-
+          {%- set location_group = (item.group_names | default([], true)
+              | select('match', 'locations_.*')
+              | reject('equalto', 'locations_usa') 
+              | first
+              | default('locations_brg')) -%}
+          {%- set site_slug_raw = location_group
+              | regex_replace('^locations_', '') -%}
+          {%- set regex_match = site_slug_raw
+              | regex_search('\\((.*?)\\)', '\\1') -%}
+          {{ regex_match[0] if regex_match else site_slug_raw }}
+
+      loop: "{{ all_source_hosts }}"
+      when:
+        - item.inventory_hostname is defined
+        - item.inventory_hostname != 'localhost'
+        - (
+            item.ansible_host
+            | default(item.primary_ip4 | default(item.primary_ip | default('')))
+            | length
+          ) > 0
+        - (item.ansible_host
+           | default(item.primary_ip4 | default(item.primary_ip | default('')))) != mirror_ip
+
+# ==========================================================
+# PLAY 1: Ubuntu Offline Patch Playbook (runs on dynamic_hosts)
+# ==========================================================
+- name: Ubuntu Offline Patch Playbook
+  hosts: dynamic_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    log_dir: "/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/ubuntu/logs"
+    mirror_host: "10.209.1.10"
+  
+  pre_tasks:
+    - name: Initialize patch variables
+      ansible.builtin.set_fact:
+        patch_error_msg: ""
+        started_epoch: "{{ ansible_date_time.epoch }}"
+        started_at: "{{ ansible_date_time.iso8601 }}"
+      changed_when: false
+
+  tasks:
+    - name: Capture kernel version before patching
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Execute patching operations
+      become: true
+      block:
+        # ----- 1. Sources List & Mirror Setup -----
+
+        - name: Add mirror host entry to /etc/hosts
+          ansible.builtin.blockinfile:
+            path: /etc/hosts
+            marker: "# {mark} ANSIBLE MANAGED MIRROR"
+            block: |
+              10.209.1.10 mirror.peratonlabs.com
+
+        - name: Verify mirror connectivity (HTTPS)
+          ansible.builtin.wait_for:
+            host: "{{ mirror_host }}"
+            port: 443
+            timeout: 30
+          become: false
+
+        - name: Check /etc/apt/sources.list state
+          ansible.builtin.stat:
+            path: /etc/apt/sources.list
+          register: sources_list
+
+        - name: Seed official sources if missing/empty
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list
+            mode: '0644'
+            content: |
+              deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} main restricted universe multiverse
+              deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }}-updates main restricted universe multiverse
+              deb http://security.ubuntu.com/ubuntu {{ ansible_distribution_release }}-security main restricted universe multiverse
+          when: not sources_list.stat.exists or sources_list.stat.size == 0
+
+        - name: Find all apt sources files
+          ansible.builtin.find:
+            paths:
+              - /etc/apt
+              - /etc/apt/sources.list.d
+            patterns: "*.list"
+            file_type: file
+          register: sources_files
+
+        - name: Remove legacy mirror entries from sources
+          ansible.builtin.lineinfile:
+            path: "{{ item.path }}"
+            regexp: '^deb\s+.10\.209\.1\.10.$'
+            state: absent
+          loop: "{{ sources_files.files }}"
+          when: sources_files.matched > 0
+
+        - name: Configure temporary local mirror
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/_tmp-local-mirror.list
+            mode: '0644'
+            content: |
+              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy main universe
+              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy-updates main universe
+              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy-security main universe
+
+        - name: Configure apt to accept mirror self-signed certificate
+          ansible.builtin.copy:
+            dest: /etc/apt/apt.conf.d/99_localmirror_tmp
+            mode: '0644'
+            content: |
+              Acquire::https::mirror.peratonlabs.com::Verify-Peer "false";
+              Acquire::https::mirror.peratonlabs.com::Verify-Host "false";
+
+        # ----- 2. Pre-flight Safety Checks -----
+
+        - name: Verify sufficient disk space in /var
+          ansible.builtin.shell: "df --output=avail -BG /var | tail -n 1 | tr -d ' G'"
+          register: space_check
+          changed_when: false
+          failed_when: (space_check.stdout | int) < 2
+
+        # ----- 3. Package Update Operations -----
+
+        - name: Update apt cache with retries
+          ansible.builtin.apt:
+            update_cache: yes
+            cache_valid_time: 0
+            update_cache_retries: 5
+            update_cache_retry_max_delay: 12
+          register: apt_result
+          changed_when: false
+          ignore_errors: yes
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        - name: Display APT error output
+          debug:
+            msg: |
+              ==================== APT UPDATE FAILED ====================
+              Return Code: {{ apt_result.rc }}
+              
+              STDOUT:
+              {{ apt_result.stdout }}
+              
+              STDERR:
+              {{ apt_result.stderr }}
+              ===========================================================
+
+
+        - name: Perform standard package upgrade
+          ansible.builtin.shell: apt-get upgrade -y --show-upgraded
+          register: upgrade_result
+          retries: 2
+          delay: 5
+          until: upgrade_result is succeeded
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+          changed_when: "'0 upgraded' not in upgrade_result.stdout"
+
+        - name: Identify held-back packages
+          ansible.builtin.shell: |
+            apt-get -s dist-upgrade | awk '/kept back/{for (i=6;i<=NF;i++){gsub(",","",$i); print $i}}'
+          register: heldback
+          changed_when: false
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        - name: Perform dist-upgrade for critical held-back packages
+          ansible.builtin.shell: apt-get dist-upgrade -y --show-upgraded
+          register: force_upgrade
+          when: heldback.stdout is search('systemd|snapd|linux-')
+          changed_when: "'upgraded' in force_upgrade.stdout or 'Setting up' in force_upgrade.stdout"
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        - name: Repair broken package dependencies
+          ansible.builtin.shell: apt-get -f install -y
+          register: fix_broken_result
+          changed_when: "'0 upgraded' not in fix_broken_result.stdout"
+          failed_when: false
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+        # ----- 4. Post-patch Cleanup -----
+
+        - name: Remove temporary mirror configuration files using rm -rf
+          ansible.builtin.command: "rm -rf {{ item }}"
+          args:
+            warn: false
+          loop:
+            - /etc/apt/sources.list.d/_tmp-local-mirror.list
+            - /etc/apt/apt.conf.d/99_localmirror_tmp
+
+        - name: Remove any remaining mirror references from sources
+          ansible.builtin.lineinfile:
+            path: "{{ item.path }}"
+            regexp: '.mirror\.peratonlabs\.com.'
+            state: absent
+          loop: "{{ sources_files.files }}"
+          when: sources_files.matched > 0
+
+        - name: Normalize permissions on apt sources files
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            mode: '0644'
+          loop: "{{ sources_files.files }}"
+          when: sources_files.matched > 0
+
+      rescue:
+        - name: Capture error details
+          ansible.builtin.set_fact:
+            patch_error_msg: "{{ ansible_failed_task.name }}: {{ ansible_failed_result.msg | default(ansible_failed_result.stderr | default('Unknown error')) }}"
+
+    # ===== OUTPUT PARSING & ANALYSIS =====
+
+    - name: Combine upgrade command outputs
+      ansible.builtin.set_fact:
+        upgrade_result_stdout: "{{ upgrade_result.stdout | default('') }} {{ force_upgrade.stdout | default('') if (force_upgrade is defined and force_upgrade.changed) else '' }}"
+      changed_when: false
+
+    - name: Check apt history log
+      ansible.builtin.stat:
+        path: /var/log/apt/history.log
+      register: apt_history_stat
+      changed_when: false
+
+    - name: Parse apt upgrade statistics
+      ansible.builtin.set_fact:
+        upgraded_count: "{{ (upgrade_result_stdout | regex_search('(\\d+) upgraded', '\\1'))[0] | default('0') }}"
+        newly_installed_count: "{{ (upgrade_result_stdout | regex_search('(\\d+) newly installed', '\\1'))[0] | default('0') }}"
+        to_remove_count: "{{ (upgrade_result_stdout | regex_search('(\\d+) to remove', '\\1'))[0] | default('0') }}"
+        not_upgraded_count: "{{ (upgrade_result_stdout | regex_search('(\\d+) not upgraded', '\\1'))[0] | default('0') }}"
+        standard_security_updates: "{{ (upgrade_result_stdout | regex_search('(\\d+) standard security updates', '\\1'))[0] | default('0') }}"
+      changed_when: false
+
+    - name: Extract upgraded packages section
+      ansible.builtin.set_fact:
+        packages_raw: "{{ upgrade_result_stdout | regex_search('(?s)The following packages will be upgraded:\\s+(.*?)\\n\\d', '\\1') }}"
+
+    - name: Parse upgraded packages list
+      ansible.builtin.set_fact:
+        upgraded_packages: "{{ (packages_raw[0] if packages_raw else '') | regex_replace('\\s+', ' ') | trim | split(' ') | select() | list }}"
+
+    - name: Extract installed packages section
+      ansible.builtin.set_fact:
+        installed_raw: "{{ upgrade_result_stdout | regex_search('(?s)The following NEW packages will be installed:\\s+(.*?)\\n\\d', '\\1', multiline=True) }}"
+
+    - name: Parse newly installed packages list
+      ansible.builtin.set_fact:
+        installed_packages: "{{ (installed_raw[0] if installed_raw else '') | regex_replace('\\s+', ' ') | trim | split(' ') | select() | list }}"
+
+    - name: Extract held-back packages section
+      ansible.builtin.set_fact:
+        held_raw: "{{ upgrade_result_stdout | regex_search('(?s)The following packages have been kept back:\\s+(.*?)\\n\\d', '\\1') }}"
+
+    - name: Parse held-back packages list
+      ansible.builtin.set_fact:
+        held_packages: "{{ (held_raw[0] if held_raw else '') | regex_replace('\\s+', ' ') | trim | split(' ') | select() | list }}"
+
+    - name: Identify kernel-related packages
+      ansible.builtin.set_fact:
+        linux_kernel_packages: "{{ (upgraded_packages + installed_packages) | select('match', '^linux-(image|modules)-[0-9]') | list }}"
+        kernel_pkg_touched: "{{ ((upgraded_packages + installed_packages) | select('match', '^linux-(image|modules|headers)-[0-9]') | list | length) > 0 }}"
+      changed_when: false
+
+    - name: Create combined package list
+      ansible.builtin.set_fact:
+        all_packages: "{{ upgraded_packages + installed_packages }}"
+      changed_when: false
+
+    - name: Determine overall patch state
+      ansible.builtin.set_fact:
+        patch_state: >-
+          {{
+            'error' if (patch_error_msg | length > 0) else
+            'updated' if (upgraded_count | int > 0 and apt_history_stat.stat.exists and apt_history_stat.stat.size > 0) else
+            'no_history' if (upgraded_count | int > 0 and (not apt_history_stat.stat.exists or apt_history_stat.stat.size == 0)) else
+            'no_change_patched' if (upgraded_count | int == 0 and apt_history_stat.stat.exists and apt_history_stat.stat.size > 0) else
+            'no_change_no_history' if (upgraded_count | int == 0 and (not apt_history_stat.stat.exists or apt_history_stat.stat.size == 0)) else
+            'unreported'
+          }}
+      changed_when: false
+
+    # ===== KERNEL & REBOOT ANALYSIS =====
+
+    - name: Determine new kernel version from installed Ubuntu kernel packages
+      ansible.builtin.set_fact:
+        kernel_after: >-
+          {{
+            (
+              linux_kernel_packages
+              | select('match', '^linux-image-[0-9]')
+              | map('regex_replace', '^linux-image-', '')
+              | list
+              | sort
+              | last
+            )
+            | default(kernel_before.stdout)
+          }}
+      changed_when: false
+
+
+
+    - name: Check for reboot-required flag
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_flag
+      changed_when: false
+
+    - name: Determine reboot necessity
+      ansible.builtin.set_fact:
+        reboot_needed: "{{ reboot_flag.stat.exists or kernel_pkg_touched }}"
+        reboot_reason: >-
+          {{
+            'kernel_upgraded' if kernel_pkg_touched else
+            'reboot_required_flag' if reboot_flag.stat.exists else
+            ''
+          }}
+      changed_when: false
+
+    # ========================
+    # Timing & summary
+    # ========================
+
+    - name: Capture finish timestamp dynamically
+      ansible.builtin.command: date +%s
+      register: finished_epoch_cmd
+      changed_when: false
+
+    - name: Set finished time fact
+      ansible.builtin.set_fact:
+        finished_epoch: "{{ finished_epoch_cmd.stdout | int }}"
+        finished_at: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        exec_time_sec: "{{ (finished_epoch_cmd.stdout | int) - (started_epoch | int) }}"
+
+    - name: Recheck held-back packages post-upgrade
+      ansible.builtin.shell: apt-get -s dist-upgrade | awk '/kept back/{for (i=6;i<=NF;i++){gsub(",","",$i); print $i}}'
+      register: heldback_final
+      changed_when: false
+      failed_when: false
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Capture system uptime (hours, minutes, seconds)
+      ansible.builtin.shell: |
+        awk '{hours=int($1/3600); mins=int(($1%3600)/60); secs=int($1%60);
+              printf "%d hours, %d minutes, %d seconds", hours, mins, secs}' /proc/uptime
+      register: uptime_result
+      changed_when: false
+
+    - name: Build comprehensive patch summary
+      ansible.builtin.set_fact:
+        patch_summary:
+          os: "Ubuntu {{ ansible_distribution_version }}"
+          host: "{{ inventory_hostname }}"
+          patch_state: "{{ patch_state }}"
+          uptime: "{{ uptime_result.stdout | default('unknown') }}"
+          timestamp: "{{ hostvars['localhost'].run_ts | default(started_at) }}"
+          log_dir: "{{ log_dir }}"
+          started_at: "{{ started_at }}"
+          finished_at: "{{ finished_at }}"
+          exec_time_sec: "{{ exec_time_sec | int }}"
+          kernel_before: "{{ kernel_before.stdout }}"
+          kernel_after: "{{ kernel_after }}"
+          kernel_changed: "{{ kernel_before.stdout != kernel_after }}"
+          reboot_needed: "{{ reboot_needed | bool }}"
+          reboot_reason: "{{ reboot_reason }}"
+          unreachable: false
+          error: "{{ patch_error_msg }}"
+          upgrade_stats:
+            upgraded: "{{ upgraded_count | int }}"
+            newly_installed: "{{ newly_installed_count | int }}"
+            to_remove: "{{ to_remove_count | int }}"
+            not_upgraded: "{{ not_upgraded_count | int }}"
+            security_updates: "{{ standard_security_updates | int }}"
+          packages:
+            upgraded: "{{ upgraded_packages }}"
+            newly_installed: "{{ installed_packages }}"
+            all_affected: "{{ all_packages }}"
+            linux_kernels: "{{ linux_kernel_packages }}"
+            held_back: "{{ held_packages }}" 
+          fix_broken:
+            changed: "{{ fix_broken_result is defined and fix_broken_result.changed }}"
+            rc: "{{ fix_broken_result.rc | default(0) }}"
+            output: "{{ fix_broken_result.stdout | default('') | trim | truncate(2000) }}"
+      changed_when: false
+
+    - name: Aggregate patch summary to localhost
+      ansible.builtin.set_fact:
+        all_hosts_summary: "{{ hostvars['localhost'].all_hosts_summary | default([]) + [patch_summary] }}"
+      delegate_to: localhost
+      delegate_facts: true
+      changed_when: false
+
+    - name: Save individual host patch summary
+      ansible.builtin.copy:
+        dest: "/tmp/patch_summary_{{ inventory_hostname }}.json"
+        content: "{{ patch_summary | to_nice_json }}"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    # ===== CONSOLIDATED REPORT FOR ALL HOSTS =====
+
+    - name: Generate consolidated patch report using Jinja2 template
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.template:
+        src: "templates/patch_summary_all_hosts.json.j2"
+        dest: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        owner: rundeck
+        group: rundeck
+        mode: "0644"
+      changed_when: false
+
+    - name: Symbolic link for latest
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.file:
+        src: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        dest: "{{ log_dir }}/master_run.json"
+        state: link
+        force: true

@@ -1,0 +1,16 @@
+plugin: networktocode.nautobot.inventory
+api_endpoint: https://opsidian.peratonlabs.com
+token: #####
+validate_certs: false
+config_context: true
+timeout: 120 
+query_filters:
+  - tags: test
+  - status: Active
+group_by:
+  - is_virtual
+virtual_machine_query_filters:
+  - has_primary_ip: 'true'
+compose:
+  ansible_user: config_context.ansible_user
+  ansible_host: primary_ip4.address | ipaddr('address')
