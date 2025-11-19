@@ -36,7 +36,7 @@
         path: /etc/hosts
         marker: "# {mark} rocky-offline-mirror"
         block: |
-          {{ mirror_host }} mirror.peratonlabs.com
+          {{ mirror_host }} ###### put your domain here
 
   tasks:
     - name: Initialize patch variables

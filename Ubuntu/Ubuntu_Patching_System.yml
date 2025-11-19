@@ -17,7 +17,7 @@
         | map(attribute='value')
         | list
       }}
-    mirror_ip: "10.209.1.10"
+    mirror_ip: "#####"
 
   pre_tasks:
     - name: Compute UTC run timestamp at playbook start
@@ -104,7 +104,7 @@
 
   vars:
     log_dir: "/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/ubuntu/logs"
-    mirror_host: "10.209.1.10"
+    mirror_host: "#####" # put your domain or ip
   
   pre_tasks:
     - name: Initialize patch variables
@@ -130,7 +130,7 @@
             path: /etc/hosts
             marker: "# {mark} ANSIBLE MANAGED MIRROR"
             block: |
-              10.209.1.10 mirror.peratonlabs.com
+              #ip #domain replace with yours
 
         - name: Verify mirror connectivity (HTTPS)
           ansible.builtin.wait_for:
@@ -166,7 +166,7 @@
         - name: Remove legacy mirror entries from sources
           ansible.builtin.lineinfile:
             path: "{{ item.path }}"
-            regexp: '^deb\s+.10\.209\.1\.10.$'
+            regexp: '##mirror up'
             state: absent
           loop: "{{ sources_files.files }}"
           when: sources_files.matched > 0
@@ -176,17 +176,17 @@
             dest: /etc/apt/sources.list.d/_tmp-local-mirror.list
             mode: '0644'
             content: |
-              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy main universe
-              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy-updates main universe
-              deb [trusted=yes] https://mirror.peratonlabs.com/updates/ubuntu/22.04/daily jammy-security main universe
+              deb [trusted=yes] https://your-offline-mirror-path jammy main universe
+              deb [trusted=yes] https://your-offline-mirror-path jammy-updates main universe
+              deb [trusted=yes] https://your-offline-mirror-path jammy-security main universe
 
         - name: Configure apt to accept mirror self-signed certificate
           ansible.builtin.copy:
             dest: /etc/apt/apt.conf.d/99_localmirror_tmp
             mode: '0644'
             content: |
-              Acquire::https::mirror.peratonlabs.com::Verify-Peer "false";
-              Acquire::https::mirror.peratonlabs.com::Verify-Host "false";
+              Acquire::https::#your mirror domain#::Verify-Peer "false";
+              Acquire::https::#your mirror domain#::Verify-Host "false";
 
         # ----- 2. Pre-flight Safety Checks -----
 
@@ -198,17 +198,11 @@
 
         # ----- 3. Package Update Operations -----
 
-        - name: Update apt cache with retries
-          ansible.builtin.apt:
-            update_cache: yes
-            cache_valid_time: 0
-            update_cache_retries: 5
-            update_cache_retry_max_delay: 12
+        - name: Run apt update command
+          command: apt update
           register: apt_result
           changed_when: false
-          ignore_errors: yes
-          environment:
-            DEBIAN_FRONTEND: noninteractive
+          ignore_errors: yes  
 
         - name: Display APT error output
           debug:
@@ -271,7 +265,7 @@
         - name: Remove any remaining mirror references from sources
           ansible.builtin.lineinfile:
             path: "{{ item.path }}"
-            regexp: '.mirror\.peratonlabs\.com.'
+            regexp: '### your mirror domain'
             state: absent
           loop: "{{ sources_files.files }}"
           when: sources_files.matched > 0

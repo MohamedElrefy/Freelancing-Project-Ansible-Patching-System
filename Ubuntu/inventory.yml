@@ -1,5 +1,5 @@
 plugin: networktocode.nautobot.inventory
-api_endpoint: https://opsidian.peratonlabs.com
+api_endpoint: #####
 token: #####
 validate_certs: false
 config_context: true
