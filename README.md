@@ -232,8 +232,8 @@ All operations capture:
 
 ### Report Locations
 
-**Rocky Linux**: `/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/rocky/logs/`
-**Ubuntu**: `/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/ubuntu/logs/`
+**Rocky Linux**: `/usr/local/ansible/projects/rocky/logs/`
+**Ubuntu**: `/usr/local/ansible/projects/ubuntu/logs/`
 
 Files:
 - `master_run_YYYY-MM-DD_HH:MM:SS_UTC.json` - Timestamped report
@@ -278,7 +278,7 @@ Both playbooks disable SSL verification for the self-signed mirror certificate:
 
 Ubuntu playbook uses location-based SSH keys stored in:
 ```
-/usr/local/ansible/keys/workstations/ansible-{site}-plabs-it-ubuntu-primary-ws-ecdsa
+/usr/local/ansible/keys/workstations/ansible-{site}-ubuntu-ecdsa
 ```
 
 Ensure these keys have restricted permissions and are properly secured.
