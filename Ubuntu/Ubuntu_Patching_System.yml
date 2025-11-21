@@ -270,13 +270,6 @@
           loop: "{{ sources_files.files }}"
           when: sources_files.matched > 0
 
-        - name: Normalize permissions on apt sources files
-          ansible.builtin.file:
-            path: "{{ item.path }}"
-            mode: '0644'
-          loop: "{{ sources_files.files }}"
-          when: sources_files.matched > 0
-
       rescue:
         - name: Capture error details
           ansible.builtin.set_fact:
