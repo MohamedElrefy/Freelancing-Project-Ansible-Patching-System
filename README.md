@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Ansible](https://img.shields.io/badge/Ansible-2.18+-EE0000?style=for-the-badge&logo=ansible&logoColor=white)](https://www.ansible.com/)
-[![Rocky Linux](https://img.shields.io/badge/Rocky_Linux-9.6-10B981?style=for-the-badge&logo=rockylinux&logoColor=white)](https://rockylinux.org/)
+[![Rocky Linux](https://img.shields.io/badge/Rocky_Linux-9.7-10B981?style=for-the-badge&logo=rockylinux&logoColor=white)](https://rockylinux.org/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 
 **Automated • Auditable • Offline-Ready**
