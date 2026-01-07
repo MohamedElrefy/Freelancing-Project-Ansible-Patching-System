@@ -1,11 +1,24 @@
 #!/bin/bash
-source /usr/local/ansible/linux-automation-2.18-env/bin/activate
-cd /usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/rocky
+set -e  
 
-export ANSIBLE_PASSWORD="$RD_OPTION_ANSIBLE_PASSWORD"
-export GHOST_PASSWORD="$RD_OPTION_GHOST_PASSWORD"
-/usr/local/ansible/linux-automation-2.18-env/bin/ansible-playbook \
+source /storage/ansible/linux-automation/bin/activate
+cd /storage/ansible/linux-automation/projects/rocky
+
+if [ -z "$RD_OPTION_NAUTOBOT_TOKEN" ]; then
+    echo "ERROR: Nautobot token not provided!"
+    exit 1
+fi
+
+sed -i "s|token: PLACEHOLDER|token: $RD_OPTION_NAUTOBOT_TOKEN|" rocky-inventory.yml
+
+cleanup() {
+    sed -i "s|token: $RD_OPTION_NAUTOBOT_TOKEN|token: PLACEHOLDER|" rocky-inventory.yml
+}
+
+trap cleanup EXIT
+
+/storage/ansible/linux-automation/bin/ansible-playbook \
   -e "ansible_user=ansible" \
-  -i inventory.yml \
-  rocky-test.yml \
+  -i rocky-inventory.yml \
+  rocky-production.yml \
   -vvv
