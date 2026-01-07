@@ -17,7 +17,7 @@
         | map(attribute='value')
         | list
       }}
-    mirror_ip: "#####"
+    mirror_ip: "# your-mirror-ip #"
 
   pre_tasks:
     - name: Compute UTC run timestamp at playbook start
@@ -26,7 +26,7 @@
       become: false
       ansible.builtin.set_fact:
         run_ts: "{{ lookup('pipe','date -u +%Y%m%dT%H%M%SZ') }}"
-        run_ts_human: "{{ lookup('pipe', 'date -u +%Y-%m-%d_%H:%M:%S_UTC') }}"
+        run_ts_human: "{{ lookup('pipe', 'date -u +%Y-%m-%d-%H:%M:%S-UTC') }}"
       delegate_facts: true
 
   tasks:
@@ -58,7 +58,7 @@
               | regex_search('\\((.*?)\\)', '\\1') -%}
           {%- set key_slug = regex_match[0]
               if regex_match else site_slug_raw -%}
-          {{ '/usr/local/ansible/keys/workstations/ansible-' + key_slug + '-plabs-it-ubuntu-primary-ws-ecdsa' }}
+          {{ '/storage/ansible/keys/workstations/ansible-' + key_slug + '-plabs-it-ubuntu-primary-ws-ecdsa' }}
 
         ansible_ssh_common_args: >-
           -o StrictHostKeyChecking=no
@@ -73,7 +73,7 @@
         site_slug: >-
           {%- set location_group = (item.group_names | default([], true)
               | select('match', 'locations_.*')
-              | reject('equalto', 'locations_usa') 
+              | reject('equalto', 'locations_usa')
               | first
               | default('locations_brg')) -%}
           {%- set site_slug_raw = location_group
@@ -103,16 +103,56 @@
   gather_facts: true
 
   vars:
-    log_dir: "/usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/ubuntu/logs"
-    mirror_host: "#####" # put your domain or ip
-  
+    log_dir: "/storage/ansible/linux-automation/projects/ubuntu/logs"
+    mirror_host: "# your-mirror-ip #"
+
   pre_tasks:
+
     - name: Initialize patch variables
       ansible.builtin.set_fact:
         patch_error_msg: ""
         started_epoch: "{{ ansible_date_time.epoch }}"
         started_at: "{{ ansible_date_time.iso8601 }}"
       changed_when: false
+
+    # ==========================================================
+    # NEW: Prevent future PAM "password expired / no TTY" failures
+    #      (idempotent; only fixes if shadow is locked with '!')
+    # ==========================================================
+    - name: Ensure ansible service account never expires (and is not shadow-locked)
+      become: true
+      block:
+        - name: Read shadow entry for ansible (root-only)
+          ansible.builtin.command: "getent shadow ansible"
+          register: ansible_shadow
+          changed_when: false
+          failed_when: false
+
+        - name: Decide if ansible account needs remediation (shadow has '!' lock)
+          ansible.builtin.set_fact:
+            ansible_shadow_locked: >-
+              {{
+                (ansible_shadow.stdout | default('')) is match('^ansible:!.*')
+              }}
+          changed_when: false
+
+        - name: Remove password lock by deleting password (SSH-key service account)
+          ansible.builtin.command: "passwd -d ansible"
+          when: ansible_shadow_locked | bool
+          changed_when: false
+          failed_when: false
+
+        - name: Disable password aging/inactivity/account expiry for ansible
+          ansible.builtin.command: "chage -M -1 -m 0 -W 0 -I -1 -E -1 ansible"
+          changed_when: false
+          failed_when: false
+
+        - name: Reset faillock counters for ansible if present
+          ansible.builtin.shell: "command -v faillock >/dev/null 2>&1 && faillock --user ansible --reset || true"
+          args:
+            executable: /bin/bash
+          changed_when: false
+          failed_when: false
 
   tasks:
     - name: Capture kernel version before patching
@@ -130,7 +170,7 @@
             path: /etc/hosts
             marker: "# {mark} ANSIBLE MANAGED MIRROR"
             block: |
-              #ip #domain replace with yours
+              # your-mirror-ip # mirror[Domain/(or)ip]
 
         - name: Verify mirror connectivity (HTTPS)
           ansible.builtin.wait_for:
@@ -166,7 +206,7 @@
         - name: Remove legacy mirror entries from sources
           ansible.builtin.lineinfile:
             path: "{{ item.path }}"
-            regexp: '##mirror up'
+            regexp: '^deb\s+.the ip$'
             state: absent
           loop: "{{ sources_files.files }}"
           when: sources_files.matched > 0
@@ -176,17 +216,17 @@
             dest: /etc/apt/sources.list.d/_tmp-local-mirror.list
             mode: '0644'
             content: |
-              deb [trusted=yes] https://your-offline-mirror-path jammy main universe
-              deb [trusted=yes] https://your-offline-mirror-path jammy-updates main universe
-              deb [trusted=yes] https://your-offline-mirror-path jammy-security main universe
+              deb [trusted=yes] https://mirror[Domain/(or)ip]/updates/ubuntu/22.04/daily jammy main universe
+              deb [trusted=yes] https://mirror[Domain/(or)ip]/updates/ubuntu/22.04/daily jammy-updates main universe
+              deb [trusted=yes] https://mirror[Domain/(or)ip]/updates/ubuntu/22.04/daily jammy-security main universe
 
         - name: Configure apt to accept mirror self-signed certificate
           ansible.builtin.copy:
             dest: /etc/apt/apt.conf.d/99_localmirror_tmp
             mode: '0644'
             content: |
-              Acquire::https::#your mirror domain#::Verify-Peer "false";
-              Acquire::https::#your mirror domain#::Verify-Host "false";
+              Acquire::https::mirror[Domain/(or)ip]::Verify-Peer "false";
+              Acquire::https::mirror[Domain/(or)ip]::Verify-Host "false";
 
         # ----- 2. Pre-flight Safety Checks -----
 
@@ -196,26 +236,27 @@
           changed_when: false
           failed_when: (space_check.stdout | int) < 2
 
+        # ----- 3a. Cleanup problematic repos before apt update -----
+        - name: Remove problematic Debian Stretch backports repo
+          ansible.builtin.lineinfile:
+            path: "{{ item.path }}"
+            regexp: 'deb\s+http://ftp.debian.org/debian\s+stretch-backports'
+            state: absent
+          loop: "{{ sources_files.files }}"
+          when: sources_files.matched > 0
+
+        - name: Remove Microsoft Teams repo using rm -rf
+          ansible.builtin.command: "rm -rf /etc/apt/sources.list.d/teams.list"
+          ignore_errors: true
+
+
         # ----- 3. Package Update Operations -----
 
         - name: Run apt update command
           command: apt update
           register: apt_result
           changed_when: false
-          ignore_errors: yes  
-
-        - name: Display APT error output
-          debug:
-            msg: |
-              ==================== APT UPDATE FAILED ====================
-              Return Code: {{ apt_result.rc }}
-              
-              STDOUT:
-              {{ apt_result.stdout }}
-              
-              STDERR:
-              {{ apt_result.stderr }}
-              ===========================================================
+          ignore_errors: yes
 
 
         - name: Perform standard package upgrade
@@ -256,16 +297,15 @@
 
         - name: Remove temporary mirror configuration files using rm -rf
           ansible.builtin.command: "rm -rf {{ item }}"
-          args:
-            warn: false
           loop:
             - /etc/apt/sources.list.d/_tmp-local-mirror.list
             - /etc/apt/apt.conf.d/99_localmirror_tmp
+          ignore_errors: true
 
         - name: Remove any remaining mirror references from sources
           ansible.builtin.lineinfile:
             path: "{{ item.path }}"
-            regexp: '### your mirror domain'
+            regexp: '#mirror domain'
             state: absent
           loop: "{{ sources_files.files }}"
           when: sources_files.matched > 0
@@ -363,8 +403,6 @@
           }}
       changed_when: false
 
-
-
     - name: Check for reboot-required flag
       ansible.builtin.stat:
         path: /var/run/reboot-required
@@ -396,14 +434,6 @@
         finished_epoch: "{{ finished_epoch_cmd.stdout | int }}"
         finished_at: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
         exec_time_sec: "{{ (finished_epoch_cmd.stdout | int) - (started_epoch | int) }}"
-
-    - name: Recheck held-back packages post-upgrade
-      ansible.builtin.shell: apt-get -s dist-upgrade | awk '/kept back/{for (i=6;i<=NF;i++){gsub(",","",$i); print $i}}'
-      register: heldback_final
-      changed_when: false
-      failed_when: false
-      environment:
-        DEBIAN_FRONTEND: noninteractive
 
     - name: Capture system uptime (hours, minutes, seconds)
       ansible.builtin.shell: |
@@ -442,7 +472,7 @@
             newly_installed: "{{ installed_packages }}"
             all_affected: "{{ all_packages }}"
             linux_kernels: "{{ linux_kernel_packages }}"
-            held_back: "{{ held_packages }}" 
+            held_back: "{{ held_packages }}"
           fix_broken:
             changed: "{{ fix_broken_result is defined and fix_broken_result.changed }}"
             rc: "{{ fix_broken_result.rc | default(0) }}"
@@ -472,8 +502,8 @@
       run_once: true
       become: false
       ansible.builtin.template:
-        src: "templates/patch_summary_all_hosts.json.j2"
-        dest: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        src: "templates/patch-summary-all-hosts.json.j2"
+        dest: "{{ log_dir }}/master-run-{{ hostvars['localhost'].run_ts_human }}.json"
         owner: rundeck
         group: rundeck
         mode: "0644"
@@ -484,7 +514,7 @@
       run_once: true
       become: false
       ansible.builtin.file:
-        src: "{{ log_dir }}/master_run_{{ hostvars['localhost'].run_ts_human }}.json"
+        src: "{{ log_dir }}/master-run-{{ hostvars['localhost'].run_ts_human }}.json"
         dest: "{{ log_dir }}/master_run.json"
         state: link
         force: true
