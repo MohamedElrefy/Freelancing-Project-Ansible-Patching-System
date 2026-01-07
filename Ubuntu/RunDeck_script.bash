@@ -1,11 +1,26 @@
 #!/bin/bash
-source /usr/local/ansible/linux-automation-2.18-env/bin/activate
-cd /usr/local/ansible/linux-automation-2.18-env/projects/linux-automation/ubuntu
+set -e  
 
-export ANSIBLE_PASSWORD="$RD_OPTION_ANSIBLE_PASSWORD"
-export GHOST_PASSWORD="$RD_OPTION_GHOST_PASSWORD"
-/usr/local/ansible/linux-automation-2.18-env/bin/ansible-playbook \
+source /storage/ansible/linux-automation/bin/activate
+cd /storage/ansible/linux-automation/projects/ubuntu
+
+if [ -z "$RD_OPTION_NAUTOBOT_TOKEN" ]; then
+    echo "ERROR: Nautobot token not provided!"
+    exit 1
+fi
+
+sed -i "s|token: PLACEHOLDER|token: $RD_OPTION_NAUTOBOT_TOKEN|" ubuntu-inventory.yml
+
+cleanup() {
+    sed -i "s|token: $RD_OPTION_NAUTOBOT_TOKEN|token: PLACEHOLDER|" ubuntu-inventory.yml
+}
+
+trap cleanup EXIT
+
+/storage/ansible/linux-automation/bin/ansible-playbook \
   -e "ansible_user=ansible" \
-  -i inventory.yml \
-  Ubuntu_Patching_System.yml \
+  -i ubuntu-inventory.yml \
+  ubuntu-production.yml \
   -vvv
+
+
