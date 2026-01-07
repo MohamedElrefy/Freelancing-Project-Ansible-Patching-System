@@ -1,6 +1,6 @@
 plugin: networktocode.nautobot.inventory
 api_endpoint: ######
-token: #####
+token: PLACEHOLDER
 validate_certs: false
 config_context: true
 timeout: 120 
